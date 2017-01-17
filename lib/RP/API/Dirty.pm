@@ -13,11 +13,13 @@ use strict;
 use warnings;
 use RP::API::Dirty::Schema;
 use Encode qw/decode encode/;
+use File::Spec::Functions qw/catfile catdir tmpdir/;
+use Digest::MD5 qw/md5_hex/;
 use LWP::UserAgent;
 use HTTP::Request;
-use HTTP::Request::Common;
 use Scalar::Util;
 use Data::Dumper;
+use File::Slurp;
 use URI::Escape;
 use JSON::XS;
 use Carp;
@@ -60,10 +62,10 @@ sub get_http_client
 
 	if (!defined $self->{http_client}) {
 		$self->{http_client} = LWP::UserAgent->new(
-        	timeout  => $self->get_timeout,
-        	agent    => $self->get_user_agent,
-        	ssl_opts => { verify_hostname => 0 },
-        )
+			timeout  => $self->get_timeout,
+			agent    => $self->get_user_agent,
+			ssl_opts => { verify_hostname => 0 },
+		)
 	}
 
 	return $self->{http_client};
@@ -93,16 +95,40 @@ sub AUTOLOAD
 
 sub call
 {
-	my ($self, $api_method, $data, $callback) = @_;
+	my ($self, $api_method, $api_data, $callback) = @_;
 
 	croak qq/API method "$api_method" not exists!/
 		unless RP::API::Dirty::Schema->can($api_method);
 
+	# Init
+	#
 	$self->{result}   = '';
 	$self->{status}   = '';
 	$self->{error}    = '';
 	$self->{request}  = '';
 	$self->{response} = '';
+
+	my $res;
+	my $use_cache = $api_data->{use_cache} // 0;
+
+	# Try to get from cache
+	#
+	if ($use_cache) {
+		$res = $self->_read_from_cache_file($api_method, $api_data);
+		if ($res) {
+			$self->{result} ||= $res;
+
+			# Call callback (TBD, for async requests)
+			#
+			if ($callback && ref $callback eq 'CODE') {
+				$callback->($res, $self);
+			}
+
+			# Return
+			#
+			return $res;
+		}
+	}
 
 	# Get action config
 	#
@@ -111,7 +137,7 @@ sub call
 	## Check mandaroty parameters
 	##
 	#foreach my $param (@{$cfg->{request}->{required}}) {
-	#	if (!defined $data->{$param} &&
+	#	if (!defined $api_data->{$param} &&
 	#	    !$cfg->{request}->{properties}->{$param}->{default}
 	#	) {
 	#		return _return_error(sprintf(
@@ -123,40 +149,40 @@ sub call
 
 	# Build request data
 	#
-	my $url    = $data->{url}    || $cfg->{url};
-	my $method = $data->{method} || $cfg->{method};
+	my $url    = $api_data->{url}    || $cfg->{url};
+	my $method = $api_data->{method} || $cfg->{method};
 	
 	my $param  = {};
 	while (my ($key, $prop) = each %{ $cfg->{request}->{properties} })
 	{
-		if (defined $data->{$key})
+		if (defined $api_data->{$key})
 		{
 			# Check type
 			if (defined $prop->{enum}) {
-				if (!_in_array($data->{$key}, @{ $prop->{enum} })) {
+				if (!_in_array($api_data->{$key}, @{ $prop->{enum} })) {
 					return _return_error(sprintf(
 						'%s: invalid enum-value %s=%s (allowed: %s)',
 						$api_method,
 						$key,
-						$data->{$key},
+						$api_data->{$key},
 						join(', ',  @{ $prop->{enum} })
 					));
 				}
 			}
 			elsif (defined $prop->{type} && (
-			    ($prop->{type} eq 'string' && !_is_string($data->{$key}))
-			 || ($prop->{type} eq 'integer' && !_is_int($data->{$key}))
+				($prop->{type} eq 'string' && !_is_string($api_data->{$key}))
+			 || ($prop->{type} eq 'integer' && !_is_int($api_data->{$key}))
 			)) {
 				return _return_error(sprintf(
 					'%s: invalid type %s value %s=%s',
 					$api_method,
 					$prop->{type},
 					$key,
-					$data->{$key},
+					$api_data->{$key},
 				));
 			}
 
-			$param->{$key} = $data->{$key};
+			$param->{$key} = $api_data->{$key};
 		}
 		elsif (defined $prop->{default}) {
 			$param->{$key} = $prop->{default};
@@ -174,20 +200,22 @@ sub call
 	#
 	if (my @placeholders = ($url =~ m/\{(.*?)\}/g)) {
 		foreach my $key (@placeholders) {
-			if (!defined $data->{$key}) {
+			if (!defined $api_data->{$key}) {
 				return _return_error(sprintf(
 					'%s: parameter %s is required',
 					$api_method,
 					$key,
 				));
 			}
-			$url =~ s/\{$key\}/$data->{$key}/g;
+			$url =~ s/\{$key\}/$api_data->{$key}/g;
 		}
 	}
 
+	# Using sort here for generating of cache file name later.
+	#
 	my $qs = join('&',
 				map { sprintf('%s=%s', $_, uri_escape($param->{$_})) }
-				keys %$param);
+				sort keys %$param);
 
 	# Build request
 	#
@@ -217,7 +245,7 @@ sub call
 	#
 	if ($cfg->{http_headers}) {
 		foreach my $hdr (keys %{ $cfg->{http_headers} }) {
-			if (!defined $data->{$hdr}) {
+			if (!defined $api_data->{$hdr}) {
 				return _return_error(sprintf(
 					'Header %s is required, got no value of parameter %s',
 					$cfg->{http_headers}->{$hdr},
@@ -226,7 +254,7 @@ sub call
 			}
 			$self->{request}->header(
 				$cfg->{http_headers}->{$hdr},
-				$data->{$hdr}
+				$api_data->{$hdr}
 			);
 		}
 	}
@@ -244,54 +272,56 @@ sub call
 
 	# Parse and check response
 	#
-	my $res = {};
-
 	if ($self->{response}->content
 	 && $self->{response}->content ne 'null'
 	 && index(
-	        $self->{response}->header('Content-Type'),
-	        'application/json'
-	    ) == 0
+			$self->{response}->header('Content-Type'),
+			'application/json'
+		) == 0
 	) {
-        $res = decode_json($self->{response}->content);
-    }
+		$res = decode_json($self->{response}->content);
+	}
 
-    elsif ($self->{response}->code > 200) {
-    	$res->{status} = 'http_error';
-    	$res->{error}  = sprintf(
-    		'%s %s',
-    		$self->{response}->code,
-    		$self->{response}->message,
-    	);
-    }
+	elsif ($self->{response}->code > 200) {
+		$res->{status} = 'http_error';
+		$res->{error}  = sprintf(
+			'%s %s',
+			$self->{response}->code,
+			$self->{response}->message,
+		);
+	}
 
-    else {
-    	$res->{status} = 'server_error';
-    	$res->{error}  = 'Invalid response format';
-    }
+	else {
+		$res->{status} = 'server_error';
+		$res->{error}  = 'Invalid response format';
+	}
 
-    # Make human-readable error string
-    #
-    if (defined $res->{errors} && ref $res->{errors} eq 'ARRAY') {
-    	$res->{error} = join(
-    		"; ",
-    		map { sprintf('%s: %s', $_->{name}, $_->{description}->{code}) }
-    			@{ $res->{errors} }
-    	);
-    }
-    elsif (defined $res->{errors}) {
-    	$self->{error} = $res->{errors};
-    }
+	# Make human-readable error string
+	#
+	if (defined $res->{errors} && ref $res->{errors} eq 'ARRAY') {
+		$res->{error} = join(
+			"; ",
+			map { sprintf('%s: %s', $_->{name}, $_->{description}->{code}) }
+				@{ $res->{errors} }
+		);
+	}
+	elsif (defined $res->{errors}) {
+		$self->{error} = $res->{errors};
+	}
 
-    $res->{status} ||= 'ok';
-    
-    $self->{result} ||= $res;
+	$res->{status} ||= 'ok';
 
-    # Call callback (TBD, for async requests)
-    #
-    if ($callback && ref $callback eq 'CODE') {
-    	$callback->($res, $self);
-    }
+	if ($use_cache) {
+		$self->_write_to_cache_file($api_method, $api_data, $res);
+	}
+	
+	$self->{result} ||= $res;
+
+	# Call callback (TBD, for async requests)
+	#
+	if ($callback && ref $callback eq 'CODE') {
+		$callback->($res, $self);
+	}
 
 	# Return
 	#
@@ -357,7 +387,7 @@ sub _get_api_method_cfg
 		$cfg->{mime_type} ||= RP::API::Dirty::Schema::mime_type;
 
 		$cfg->{request}->{mandatory} = { map { $_ => 1 }
-		                                 @{ $cfg->{request}->{required} } };
+										 @{ $cfg->{request}->{required} } };
 
 		$self->{cfg}->{$api_method} = $cfg;
 	}
@@ -374,6 +404,51 @@ sub _return_error
 		status	=> $error_status,
 		error	=> $error_msg,
 	});
+}
+
+sub _write_to_cache_file
+{
+	my ($self, $api_method, $api_data, $api_res) = @_;
+	my $file_name = $self->_get_cache_file_name($api_method, $api_data);
+print "Try to write to $file_name...\n";
+	return write_file($file_name, encode_json($api_res));
+}
+
+sub _read_from_cache_file
+{
+	my ($self, $api_method, $api_data) = @_;
+	my $file_name = $self->_get_cache_file_name($api_method, $api_data);
+print "Try to read from $file_name...\n";
+	my $json_text = $file_name && -e $file_name ? read_file($file_name) : '';
+	return $json_text ? decode_json($json_text) : '';
+}
+
+sub _get_cache_dir_name
+{
+	my $self = shift;
+	unless (defined $self->{cache_dir}) {
+		my $dir_name = lc __PACKAGE__;
+		$dir_name =~ s/:+/./g;
+		$dir_name = catdir(tmpdir(), $dir_name);
+		mkdir $dir_name unless -d $dir_name;
+		$self->{cache_dir} = -d $dir_name ? $dir_name : '';
+	}
+	return $self->{cache_dir};
+}
+
+sub _get_cache_file_name
+{
+	my ($self, $api_method, $api_data) = @_;
+	my $file_name;
+	my $dir_name = $self->_get_cache_dir_name();
+	if ($dir_name) {
+		$file_name = md5_hex(
+			$api_method,
+			map { $_, $api_data->{$_} } sort keys %$api_data
+		);
+		$file_name = catfile($dir_name, $file_name);
+	}
+	return $file_name;
 }
 
 1;
