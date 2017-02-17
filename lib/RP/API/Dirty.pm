@@ -228,12 +228,12 @@ sub call
 	}
 
 	elsif ($method eq 'DELETE' || $method eq 'PATCH') {
-		$url .= (index($url, '?') ? '?' : '&') . $qs;
+		$url .= (index($url, '?') > 0 ? '&' : '?') . $qs;
 		$self->{request} = HTTP::Request->new($method => $url);
 	}
 
 	elsif (!$method || $method eq 'GET') {
-		$url .= (index($url, '?') ? '?' : '&') . $qs;
+		$url .= (index($url, '?') > 0 ? '&' : '?') . $qs;
 		$self->{request} = HTTP::Request->new(GET => $url);
 	}
 
